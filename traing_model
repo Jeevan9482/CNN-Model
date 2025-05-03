@@ -1,77 +1,370 @@
-
+import os
+import yaml
+import argparse
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import tensorflow as tf
-import numpy as np
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization, Activation
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+import itertools
+import time
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+import glob
 
+def load_config(config_path):
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+    if 'paths' not in config:
+        config['paths'] = {}
+    
+    if 'model_save_path' not in config['paths']:
+        config['paths']['model_save_path'] = 'models'
+    
+    if 'best_model_name' not in config['paths']:
+        config['paths']['best_model_name'] = 'best_model.keras'
+    
+    return config
 
-img_height = 150
-img_width = 150
-batch_size = 32
-dataset_dir = "C:/JEEVAN/archive (1)/PlantVillage"
+def get_dataset_paths_and_labels(dataset_dir):
+    class_dirs = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))]
+    
+    label_to_index = {label: idx for idx, label in enumerate(sorted(class_dirs))}
+    index_to_label = {idx: label for label, idx in label_to_index.items()}
+    
+    image_paths = []
+    labels = []
+    
+    for class_dir in class_dirs:
+        class_path = os.path.join(dataset_dir, class_dir)
+        class_idx = label_to_index[class_dir]
+        
+        for ext in ['*.jpg', '*.jpeg', '*.png']:
+            img_paths = glob.glob(os.path.join(class_path, ext))
+            image_paths.extend(img_paths)
+            labels.extend([class_idx] * len(img_paths))
+    
+    return image_paths, labels, label_to_index, index_to_label
 
+def preprocess_image(img_path, img_height, img_width):
+    """Load and preprocess a single image."""
+    img = load_img(img_path, target_size=(img_height, img_width))
+    img_array = img_to_array(img)
+    img_array = img_array / 255.0  
+    return img_array
 
-train_datagen = ImageDataGenerator(
-    rescale=1./255,
-    rotation_range=30,
-    width_shift_range=0.3,
-    height_shift_range=0.3,
-    shear_range=0.3,
-    zoom_range=0.3,
-    horizontal_flip=True,
-    brightness_range=[0.8, 1.2],
-    validation_split=0.3
-)
+def generate_arrays_from_paths(image_paths, labels, batch_size, img_height, img_width, num_classes, augment=False):
+    """Generator function for creating batches of data."""
+    num_samples = len(image_paths)
+    indices = np.arange(num_samples)
+    
+    datagen = None
+    if augment:
+        datagen = ImageDataGenerator(
+            rotation_range=30,
+            width_shift_range=0.3,
+            height_shift_range=0.3,
+            shear_range=0.3,
+            zoom_range=0.3,
+            horizontal_flip=True,
+            brightness_range=[0.8, 1.2]
+        )
+    
+    while True:
+        np.random.shuffle(indices)
+        
+        for start_idx in range(0, num_samples, batch_size):
+            batch_indices = indices[start_idx:start_idx + batch_size]
+            
+            batch_paths = [image_paths[i] for i in batch_indices]
+            batch_labels = [labels[i] for i in batch_indices]
+            
+            batch_images = np.array([preprocess_image(path, img_height, img_width) for path in batch_paths])
+            
+            if augment and datagen is not None:
+                batch_images = next(datagen.flow(batch_images, batch_size=len(batch_images))).astype(np.float32)
+            
+            batch_labels_one_hot = tf.keras.utils.to_categorical(batch_labels, num_classes=num_classes)
+            
+            yield batch_images, batch_labels_one_hot
 
-train_generator = train_datagen.flow_from_directory(
-    dataset_dir,
-    target_size=(img_height, img_width),
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='training'
-)
+def create_model(config, num_classes, lr=1e-4, l2_norm=1e-3, dropout_rate=0.1):
+    img_height = config['model']['img_height']
+    img_width = config['model']['img_width']
+    
+    model = Sequential()
+    filter_sizes = config['model']['filter_sizes']
+    num_conv_layers = min(len(filter_sizes), config['model']['conv_layers'])
+    
+    model.add(Conv2D(
+        filter_sizes[0], 
+        (config['model']['kernel_size'], config['model']['kernel_size']),
+        padding='same',
+        use_bias=config['model']['use_bias'],
+        kernel_regularizer=l2(l2_norm),
+        input_shape=(img_height, img_width, 3)
+    ))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    
+    for i in range(1, num_conv_layers):
+        model.add(Conv2D(
+            filter_sizes[i], 
+            (config['model']['kernel_size'], config['model']['kernel_size']),
+            padding='same',
+            use_bias=config['model']['use_bias'],
+            kernel_regularizer=l2(l2_norm)
+        ))
+        model.add(BatchNormalization())
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+    
+    model.add(Flatten())
+    model.add(Dense(
+        config['model']['dense_units'],
+        use_bias=config['model']['use_bias'],
+        kernel_regularizer=l2(l2_norm)
+    ))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Dropout(dropout_rate))
+    
+    model.add(Dense(num_classes, activation='softmax'))
+    
+    optimizer = Adam(learning_rate=lr)
+    model.compile(
+        optimizer=optimizer,
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
 
-validation_generator = train_datagen.flow_from_directory(
-    dataset_dir,
-    target_size=(img_height, img_width),
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='validation'
-)
+def train_model(model, train_generator, val_generator, config, train_samples, val_samples):
+    """Train the model with the given data."""
+    batch_size = config['training']['batch_size']
+    epochs = config['training']['epochs']
+    
+    train_steps = train_samples // batch_size
+    val_steps = val_samples // batch_size
+    
+    train_steps = max(1, train_steps)
+    val_steps = max(1, val_steps)
+    
+    if 'paths' not in config:
+        config['paths'] = {}
+    if 'model_save_path' not in config['paths']:
+        config['paths']['model_save_path'] = 'models'
+    
+    os.makedirs(config['paths']['model_save_path'], exist_ok=True)
+    
+    early_stop = EarlyStopping(
+        monitor='val_accuracy', 
+        patience=config['training']['early_stopping_patience'], 
+        restore_best_weights=True
+    )
+    
+    lr_scheduler = ReduceLROnPlateau(
+        monitor='val_loss', 
+        factor=config['training']['lr_reduction_factor'], 
+        patience=config['training']['lr_reduction_patience'], 
+        min_lr=config['training']['min_lr'], 
+        verbose=1
+    )
+    
+    checkpoint_path = os.path.join(config['paths']['model_save_path'], "checkpoint_model.keras")
+    model_checkpoint = ModelCheckpoint(
+        filepath=checkpoint_path,
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=1
+    )
+    
+    history = model.fit(
+        train_generator,
+        steps_per_epoch=train_steps,
+        epochs=epochs,
+        validation_data=val_generator,
+        validation_steps=val_steps,
+        callbacks=[early_stop, lr_scheduler, model_checkpoint]
+    )
+    
+    return history
 
+def plot_training_history(history, model_name):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    ax1.plot(history.history['accuracy'], label='Training Accuracy')
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_title('Model Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.legend()
+    
+    ax2.plot(history.history['loss'], label='Training Loss')
+    ax2.plot(history.history['val_loss'], label='Validation Loss')  
+    ax2.set_title('Model Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    
+    plt.tight_layout()
+    
+    os.makedirs('training_plots', exist_ok=True)
+    
+    plt.savefig(f'training_plots/{model_name}_training_history.png')
+    plt.close()
 
-model = Sequential()
-model.add(Conv2D(32, (3, 3), activation='relu', input_shape=(img_height, img_width, 3)))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
+def grid_search(config, image_paths, labels, label_to_index):
+    learning_rates = config['hyperparameters']['learning_rates']
+    l2_norms = config['hyperparameters']['l2_regularization']
+    dropout_rates = config['hyperparameters']['dropout_rates']
+    
+    if 'paths' not in config:
+        config['paths'] = {}
+    if 'model_save_path' not in config['paths']:
+        config['paths']['model_save_path'] = 'models'
+    if 'best_model_name' not in config['paths']:
+        config['paths']['best_model_name'] = 'best_model.keras'
+        
+    os.makedirs(config['paths']['model_save_path'], exist_ok=True)
+    os.makedirs('training_plots', exist_ok=True)
+    
+    train_paths, val_paths, train_labels, val_labels = train_test_split(
+        image_paths, labels, 
+        test_size=config['training']['validation_split'], 
+        stratify=labels, 
+        random_state=42
+    )
+    
+    num_classes = len(label_to_index)
+    print(f"Number of classes: {num_classes}")
+    print(f"Training samples: {len(train_paths)}")
+    print(f"Validation samples: {len(val_paths)}")
+    
+    results = []
+    best_val_acc = 0
+    best_model = None
+    best_hyperparams = {}
+    
+    for lr, l2_norm, dropout_rate in itertools.product(learning_rates, l2_norms, dropout_rates):
+        print(f"\nTraining with hyperparameters: LR={lr}, L2={l2_norm}, Dropout={dropout_rate}")
+        
+        model_name = f"model_lr{lr}_l2{l2_norm}_drop{dropout_rate}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        model = create_model(
+            config, 
+            num_classes=num_classes,
+            lr=lr, 
+            l2_norm=l2_norm, 
+            dropout_rate=dropout_rate
+        )
+        
+        batch_size = config['training']['batch_size']
+        img_height = config['model']['img_height']
+        img_width = config['model']['img_width']
+        
+        train_generator = generate_arrays_from_paths(
+            train_paths, train_labels, batch_size, img_height, img_width, num_classes, augment=True
+        )
+        
+        val_generator = generate_arrays_from_paths(
+            val_paths, val_labels, batch_size, img_height, img_width, num_classes, augment=False
+        )
+        
+        start_time = time.time()
+        history = train_model(
+            model, 
+            train_generator, 
+            val_generator, 
+            config, 
+            len(train_paths), 
+            len(val_paths)
+        )
+        training_time = time.time() - start_time
+        
+        plot_training_history(history, model_name)
+        
+        val_steps = max(1, len(val_paths) // batch_size)
+        val_metrics = model.evaluate(
+            val_generator,
+            steps=val_steps
+        )
+        val_loss, val_acc = val_metrics
+        
+        result = {
+            'model_name': model_name,
+            'learning_rate': lr,
+            'l2_norm': l2_norm,
+            'dropout_rate': dropout_rate,
+            'val_accuracy': val_acc,
+            'val_loss': val_loss,
+            'epochs_trained': len(history.history['accuracy']),
+            'training_time': training_time
+        }
+        results.append(result)
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model = model
+            best_hyperparams = {
+                'learning_rate': lr,
+                'l2_norm': l2_norm,
+                'dropout_rate': dropout_rate
+            }
+            
+        print(f"Validation accuracy: {val_acc:.4f}, Loss: {val_loss:.4f}")
+        
+        model_save_path = os.path.join(config['paths']['model_save_path'], f"{model_name}.keras")
+        model.save(model_save_path)
+        print(f"Model saved to {model_save_path}")
+    
+    results_df = pd.DataFrame(results)
+    results_df.to_csv('grid_search_results.csv', index=False)
+    
+    if best_model:
+        best_model_path = os.path.join(config['paths']['model_save_path'], config['paths']['best_model_name'])
+        best_model.save(best_model_path)
+        print(f"\nBest model saved to {best_model_path}")
+        print(f"Best hyperparameters: {best_hyperparams}")
+        print(f"Best validation accuracy: {best_val_acc:.4f}")
+    
+    return results_df, best_model, best_hyperparams
 
+def main():
+    parser = argparse.ArgumentParser(description='Train plant disease classification model')
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
+    args = parser.parse_args()
+    
+    config = load_config(args.config)
+    
+    if 'paths' not in config or 'dataset_dir' not in config['paths']:
+        raise ValueError("Dataset directory not specified in config file")
+    
+    os.makedirs(config['paths']['model_save_path'], exist_ok=True)
+    
+    image_paths, labels, label_to_index, index_to_label = get_dataset_paths_and_labels(config['paths']['dataset_dir'])
+    
+    print(f"Using image size: {config['model']['img_height']}x{config['model']['img_width']}")
+    print(f"Found {len(image_paths)} images across {len(label_to_index)} classes")
+    
+    results_df, best_model, best_hyperparams = grid_search(
+        config, 
+        image_paths, 
+        labels, 
+        label_to_index
+    )
+    
+    if best_model:
+        best_model.summary()
+    
+    print("\nGrid search complete. Results saved to grid_search_results.csv")
 
-model.add(Conv2D(64, (3, 3), activation='relu', kernel_regularizer=l2(0.01)))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-
-
-model.add(Conv2D(128, (3, 3), activation='relu', kernel_regularizer=l2(0.01)))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-
-""""
-model.add(Conv2D(256, (3, 3), activation='relu', kernel_regularizer=l2(0.01)))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-"""
-
-model.add(Flatten())
-model.add(Dense(256, activation='relu', kernel_regularizer=l2(0.01)))
-model.add(Dropout(0.5))
-model.add(Dense(len(train_generator.class_indices), activation='softmax'))
-
-
-model.compile(optimizer=Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-history = model.fit(train_generator,epochs=20,validation_data=validation_generator)
-
-model.save('final_image_classifier_model.keras')
+if __name__ == "__main__":
+    main()
